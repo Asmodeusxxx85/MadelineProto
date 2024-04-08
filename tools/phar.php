@@ -2,7 +2,7 @@
 
 namespace danog\MadelineProto;
 
-if ((PHP_MAJOR_VERSION === 8 && PHP_MINOR_VERSION < 1) || PHP_MAJOR_VERSION < 8) {
+if ((PHP_MAJOR_VERSION === 8 && PHP_MINOR_VERSION < 2) || PHP_MAJOR_VERSION < 8) {
     die('MadelineProto requires at least PHP 8.2, PHP 8.3+ is recommended.'.PHP_EOL);
 }
 
@@ -140,7 +140,7 @@ class Installer
                     'Content-Type: application/json',
                     sprintf(
                         'User-Agent: Composer/%s (%s; %s; %s; %s%s)',
-                        'MProto v7',
+                        'MP v8',
                         \function_exists('php_uname') ? @php_uname('s') : 'Unknown',
                         \function_exists('php_uname') ? @php_uname('r') : 'Unknown',
                         $phpVersion,
