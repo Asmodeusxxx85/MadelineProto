@@ -26,6 +26,7 @@ use Amp\Future;
 use Amp\Http\Client\Request;
 use AssertionError;
 use danog\Decoder\FileIdType;
+use danog\MadelineProto\BotApiFileId;
 use danog\MadelineProto\EventHandler\Media;
 use danog\MadelineProto\EventHandler\Media\AnimatedSticker;
 use danog\MadelineProto\EventHandler\Media\Audio;
@@ -46,8 +47,10 @@ use danog\MadelineProto\FileCallbackInterface;
 use danog\MadelineProto\FileRedirect;
 use danog\MadelineProto\Logger;
 use danog\MadelineProto\MTProtoTools\Crypt\IGE;
+use danog\MadelineProto\RPCError\FileTokenInvalidError;
+use danog\MadelineProto\RPCError\FloodPremiumWaitError;
 use danog\MadelineProto\RPCError\FloodWaitError;
-use danog\MadelineProto\RPCErrorException;
+use danog\MadelineProto\RPCError\RequestTokenInvalidError;
 use danog\MadelineProto\SecurityException;
 use danog\MadelineProto\Settings;
 use danog\MadelineProto\StreamEof;
@@ -356,6 +359,12 @@ trait Files
                         }
                         $d->complete();
                         return;
+                    } catch (FloodPremiumWaitError $e) {
+                        $this->logger("Got {$e->rpc} while uploading $part_num: {$datacenter}, retrying...");
+                        $writePromise = async(static function () use ($cancellation, $e, $writeCb): void {
+                            $e->wait($cancellation);
+                            $writeCb();
+                        });
                     } catch (FileRedirect $e) {
                         $datacenter = $e->dc;
                         $this->logger("Got redirect while uploading $part_num: {$datacenter}");
@@ -658,17 +667,14 @@ trait Files
         return $this->genAllFile($constructor);
     }
     /**
-     * Get download info of the propic of a user
-     * Returns an array with the following structure:.
-     *
-     * `$info['ext']` - The file extension
-     * `$info['name']` - The file name, without the extension
-     * `$info['mime']` - The file mime type
-     * `$info['size']` - The file size
+     * Gets info of the propic of a user.
      */
-    public function getPropicInfo($data): array
+    public function getPropicInfo($data): ?Photo
     {
-        return $this->getDownloadInfo($this->peerDatabase->get($this->getId($data)));
+        if (!$this->getSettings()->getDb()->getEnableFullPeerDb()) {
+            throw new AssertionError("getPropicInfo cannot be used if the full peer database is disabled!");
+        }
+        return $this->getPwrChat($data, false)['photo'] ?? null;
     }
     /**
      * Extract file info from bot API message.
@@ -726,6 +732,18 @@ trait Files
      */
     public function getDownloadInfo(mixed $messageMedia): array
     {
+        if ($messageMedia instanceof BotApiFileId) {
+            $res = $this->getDownloadInfo($messageMedia->fileId);
+            $res['size'] = $messageMedia->size;
+            $pathinfo = pathinfo($messageMedia->fileName);
+            if (isset($pathinfo['extension'])) {
+                $res['ext'] = '.'.$pathinfo['extension'];
+            } else {
+                $res['ext'] = '';
+            }
+            $res['name'] = $pathinfo['filename'];
+            return $res;
+        }
         if ($messageMedia instanceof Message) {
             $messageMedia = $messageMedia->media;
         }
@@ -748,6 +766,8 @@ trait Files
                 $pathinfo = pathinfo($messageMedia['file_name']);
                 if (isset($pathinfo['extension'])) {
                     $res['ext'] = '.'.$pathinfo['extension'];
+                } else {
+                    $res['ext'] = '';
                 }
                 $res['name'] = $pathinfo['filename'];
                 return $res;
@@ -789,6 +809,8 @@ trait Files
                     $pathinfo = pathinfo($messageMedia['file_name']);
                     if (isset($pathinfo['extension'])) {
                         $res['ext'] = '.'.$pathinfo['extension'];
+                    } else {
+                        $res['ext'] = '';
                     }
                     $res['name'] = $pathinfo['filename'];
                 }
@@ -804,6 +826,8 @@ trait Files
                                 $pathinfo = pathinfo($attribute['file_name']);
                                 if (isset($pathinfo['extension'])) {
                                     $res['ext'] = '.'.$pathinfo['extension'];
+                                } else {
+                                    $res['ext'] = '';
                                 }
                                 $res['name'] = $pathinfo['filename'];
                                 break;
@@ -1051,7 +1075,7 @@ trait Files
                 });
             };
         }
-        if ($end === -1 && isset($messageMedia['size'])) {
+        if ($end === -1 && isset($messageMedia['size']) && $messageMedia['size'] !== 0) {
             $end = $messageMedia['size'];
         }
         $part_size ??= 1024 * 1024;
@@ -1124,10 +1148,10 @@ trait Files
             foreach ($params as $key => $param) {
                 $cancellation?->throwIfRequested();
                 $param['previous_promise'] = $previous_promise;
-                $previous_promise = async($this->downloadPart(...), $messageMedia, $cdn, $datacenter, $old_dc, $ige, $cb, $param, $callable, $seekable, $cancellation);
+                $previous_promise = async($this->downloadPart(...), $messageMedia, $cdn, $datacenter, $old_dc, $ige, $cb, $param, $callable, $seekable, $cancellation)->ignore();
                 $previous_promise->map(static function (int $res) use (&$size): void {
                     $size += $res;
-                });
+                })->ignore();
                 $promises[] = $previous_promise;
                 if (\count($promises) === $parallel_chunks) {
                     // 20 mb at a time, for a typical bandwidth of 1gbps
@@ -1193,17 +1217,14 @@ trait Files
                     break;
                 } catch (FileRedirect $e) {
                     $datacenter = $e->dc;
-                } catch (FloodWaitError $e) {
+                } catch (FloodWaitError) {
                     delay(1, cancellation: $cancellation);
-                } catch (RPCErrorException $e) {
-                    switch ($e->rpc) {
-                        case 'FILE_TOKEN_INVALID':
-                            $cdn = false;
-                            $datacenter = $this->authorized_dc;
-                            continue 3;
-                        default:
-                            throw $e;
-                    }
+                } catch (FloodPremiumWaitError $e) {
+                    $e->wait($cancellation);
+                } catch (FileTokenInvalidError) {
+                    $cdn = false;
+                    $datacenter = $this->authorized_dc;
+                    continue 2;
                 }
             } while (true);
             $cancellation?->throwIfRequested();
@@ -1226,16 +1247,10 @@ trait Files
                 $this->getConfig();
                 try {
                     $this->addCdnHashes($messageMedia['file_token'], $this->methodCallAsyncRead('upload.reuploadCdnFile', ['file_token' => $messageMedia['file_token'], 'request_token' => $res['request_token'], 'cancellation' => $cancellation], $this->authorized_dc));
-                } catch (RPCErrorException $e) {
-                    switch ($e->rpc) {
-                        case 'FILE_TOKEN_INVALID':
-                        case 'REQUEST_TOKEN_INVALID':
-                            $cdn = false;
-                            $datacenter = $this->authorized_dc;
-                            continue 2;
-                        default:
-                            throw $e;
-                    }
+                } catch (FileTokenInvalidError|RequestTokenInvalidError) {
+                    $cdn = false;
+                    $datacenter = $this->authorized_dc;
+                    continue;
                 }
                 continue;
             }

@@ -30,7 +30,6 @@ use Amp\TimeoutException;
 use danog\MadelineProto\ApiWrappers\Start;
 use danog\MadelineProto\Ipc\Client;
 use danog\MadelineProto\Ipc\Server;
-use danog\MadelineProto\Settings\Database\DriverDatabaseAbstract;
 use danog\MadelineProto\Settings\Ipc as SettingsIpc;
 use danog\MadelineProto\Settings\Logger as SettingsLogger;
 use Revolt\EventLoop;
@@ -52,7 +51,7 @@ final class API extends AbstractAPI
      *
      * @var string
      */
-    public const RELEASE = '8.0.0-beta198';
+    public const RELEASE = '8.2.0';
     /**
      * We're not logged in.
      *
@@ -296,12 +295,6 @@ final class API extends AbstractAPI
             $forceFull = $forceFull || $settings->getSlow();
         } elseif ($settings instanceof Settings) {
             $forceFull = $forceFull || $settings->getIpc()->getSlow();
-            $db = $settings->getDb();
-            if ($db instanceof DriverDatabaseAbstract) {
-                $forceFull = (bool) $db->getEphemeralFilesystemPrefix();
-            }
-        } elseif ($settings instanceof DriverDatabaseAbstract) {
-            $forceFull = (bool) $settings->getEphemeralFilesystemPrefix();
         }
         $forceFull = $forceFull || isset($_GET['MadelineSelfRestart']) || Magic::$altervista;
 

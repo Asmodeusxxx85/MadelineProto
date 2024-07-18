@@ -21,15 +21,17 @@ declare(strict_types=1);
 namespace danog\MadelineProto\MTProtoTools;
 
 use AssertionError;
-use danog\Decoder\FileId;
-use danog\Decoder\FileIdType;
-use danog\Decoder\PhotoSizeSource\PhotoSizeSourceDialogPhotoBig;
-use danog\Decoder\PhotoSizeSource\PhotoSizeSourceDialogPhotoSmall;
+use danog\DialogId\DialogId;
 use danog\MadelineProto\API;
+use danog\MadelineProto\EventHandler\Message\Entities\InputMentionName;
+use danog\MadelineProto\EventHandler\Message\Entities\MentionName;
 use danog\MadelineProto\Exception;
 use danog\MadelineProto\Logger;
 use danog\MadelineProto\Magic;
 use danog\MadelineProto\PeerNotInDbException;
+use danog\MadelineProto\RPCError\ChannelPrivateError;
+use danog\MadelineProto\RPCError\ChatAdminRequiredError;
+use danog\MadelineProto\RPCError\ChatForbiddenError;
 use danog\MadelineProto\RPCErrorException;
 use danog\MadelineProto\Settings;
 use danog\MadelineProto\Tools;
@@ -90,15 +92,9 @@ trait PeerHandler
     {
         try {
             return $this->peerDatabase->isset($this->getIdInternal($id));
-        } catch (Exception $e) {
-            return false;
-        } catch (RPCErrorException $e) {
-            if ($e->rpc === 'CHAT_FORBIDDEN') {
-                return true;
-            }
-            if ($e->rpc === 'CHANNEL_PRIVATE') {
-                return true;
-            }
+        } catch (ChannelPrivateError|ChatForbiddenError) {
+            return true;
+        } catch (RPCErrorException|Exception) {
             return false;
         }
     }
@@ -112,7 +108,15 @@ trait PeerHandler
     {
         try {
             foreach ($entities as $entity) {
-                if ($entity['_'] === 'messageEntityMentionName' || $entity['_'] === 'inputMessageEntityMentionName') {
+                if ($entity instanceof MentionName) {
+                    if (!($this->peerIsset($entity->userId))) {
+                        return false;
+                    }
+                } elseif ($entity instanceof InputMentionName) {
+                    if (!($this->peerIsset($entity->userId))) {
+                        return false;
+                    }
+                } elseif (\is_array($entity) && ($entity['_'] === 'messageEntityMentionName' || $entity['_'] === 'inputMessageEntityMentionName')) {
                     if (!($this->peerIsset($entity['user_id']))) {
                         return false;
                     }
@@ -223,6 +227,7 @@ trait PeerHandler
                     }
                     return $id['from_id'];
                 case 'peerChannel':
+                case 'requestedPeerChannel':
                 case 'inputChannel':
                 case 'inputPeerChannel':
                 case 'inputChannelFromMessage':
@@ -276,6 +281,7 @@ trait PeerHandler
                 case 'inputPeerUser':
                 case 'inputUser':
                 case 'peerUser':
+                case 'requestedPeerUser':
                 case 'messageEntityMentionName':
                 case 'messageActionChatDeleteUser':
                     return $id['user_id'];
@@ -632,7 +638,7 @@ trait PeerHandler
      */
     public function fullChatLastUpdated(mixed $id): int
     {
-        return $this->peerDatabase->getFull($this->getIdInternal($id))['last_update'] ?? 0;
+        return $this->peerDatabase->getFull($this->getIdInternal($id))['inserted'] ?? 0;
     }
     /**
      * Get full info about peer, returns an FullInfo object.
@@ -647,7 +653,7 @@ trait PeerHandler
             return $partial;
         }
         $full = $this->peerDatabase->getFull($partial['bot_api_id']);
-        if (time() - ($full['last_update'] ?? 0) < $this->getSettings()->getPeer()->getFullInfoCacheTime()) {
+        if (time() - ($full['inserted'] ?? 0) < $this->getSettings()->getPeer()->getFullInfoCacheTime()) {
             return array_merge($partial, $full);
         }
         switch ($partial['type']) {
@@ -674,7 +680,7 @@ trait PeerHandler
     public function getPwrChat(mixed $id, bool $fullfetch = true): array
     {
         try {
-            $full = $fullfetch && $this->getSettings()->getDb()->getEnableFullPeerDb() ? $this->getFullInfo($id) : $this->getInfo($id);
+            $full = $this->getSettings()->getDb()->getEnableFullPeerDb() ? $this->getFullInfo($id) : $this->getInfo($id);
         } catch (Throwable) {
             $full = $this->getInfo($id);
         }
@@ -692,8 +698,14 @@ trait PeerHandler
                         $res[$key] = $full['full'][$key];
                     }
                 }
-                if (isset($full['full']['profile_photo']['sizes'])) {
+                if (isset($full['full']['profile_photo'])) {
                     $res['photo'] = $full['full']['profile_photo'];
+                }
+                if (isset($full['full']['fallback_photo'])) {
+                    $res['fallback_photo'] = $full['full']['fallback_photo'];
+                }
+                if (isset($full['full']['personal_photo'])) {
+                    $res['personal_photo'] = $full['full']['personal_photo'];
                 }
                 break;
             case 'chat':
@@ -710,7 +722,7 @@ trait PeerHandler
                 if (isset($res['admins_enabled'])) {
                     $res['all_members_are_administrators'] = !$res['admins_enabled'];
                 }
-                if (isset($full['full']['chat_photo']['sizes'])) {
+                if (isset($full['full']['chat_photo'])) {
                     $res['photo'] = $full['full']['chat_photo'];
                 }
                 if (isset($full['full']['exported_invite']['link'])) {
@@ -732,14 +744,11 @@ trait PeerHandler
                         $res[$key] = $full['full'][$key];
                     }
                 }
-                if (isset($full['full']['chat_photo']['sizes'])) {
+                if (isset($full['full']['chat_photo'])) {
                     $res['photo'] = $full['full']['chat_photo'];
                 }
                 if (isset($full['full']['exported_invite']['link'])) {
                     $res['invite'] = $full['full']['exported_invite']['link'];
-                }
-                if (isset($full['full']['participants']['participants'])) {
-                    $res['participants'] = $full['full']['participants']['participants'];
                 }
                 break;
         }
@@ -750,26 +759,11 @@ trait PeerHandler
                 if (isset($participant['inviter_id'])) {
                     $newres['inviter'] = ($this->getPwrChat($participant['inviter_id'], false));
                 }
-                if (isset($participant['promoted_by'])) {
-                    $newres['promoted_by'] = ($this->getPwrChat($participant['promoted_by'], false));
-                }
                 if (isset($participant['kicked_by'])) {
                     $newres['kicked_by'] = ($this->getPwrChat($participant['kicked_by'], false));
                 }
                 if (isset($participant['date'])) {
                     $newres['date'] = $participant['date'];
-                }
-                if (isset($participant['admin_rights'])) {
-                    $newres['admin_rights'] = $participant['admin_rights'];
-                }
-                if (isset($participant['banned_rights'])) {
-                    $newres['banned_rights'] = $participant['banned_rights'];
-                }
-                if (isset($participant['can_edit'])) {
-                    $newres['can_edit'] = $participant['can_edit'];
-                }
-                if (isset($participant['left'])) {
-                    $newres['left'] = $participant['left'];
                 }
                 switch ($participant['_']) {
                     case 'chatParticipant':
@@ -813,36 +807,6 @@ trait PeerHandler
         if (!$fullfetch) {
             unset($res['participants']);
         }
-        if (isset($res['photo'])) {
-            $photo = [];
-            foreach ([
-                'small' => $res['photo']['sizes'][0],
-                'big' => Tools::maxSize($res['photo']['sizes']),
-            ] as $type => $size) {
-                $photoSize = $type === 'small'
-                        ? PhotoSizeSourceDialogPhotoSmall::class
-                        : PhotoSizeSourceDialogPhotoBig::class;
-                $photoSize = new $photoSize(
-                    dialogId: $res['id'],
-                    dialogAccessHash: $res['access_hash'],
-                );
-
-                $fileId = new FileId(
-                    dcId: $res['photo']['dc_id'],
-                    type: FileIdType::PROFILE_PHOTO,
-                    id: $res['photo']['id'],
-                    accessHash: $res['photo']['access_hash'],
-                    fileReference: $res['photo']['file_reference'] === null
-                        ? null
-                        : (string) $res['photo']['file_reference'],
-                    photoSizeSource: $photoSize
-                );
-
-                $photo[$type.'_file_id'] = (string) $fileId;
-                $photo[$type.'_file_unique_id'] = $fileId->getUniqueBotAPI();
-            }
-            $res['photo'] += $photo;
-        }
         return $res;
     }
     private function recurseAlphabetSearchParticipants(int $channel, string $filter, string $q, int $total_count, array &$res, int $depth): array
@@ -885,12 +849,9 @@ trait PeerHandler
         do {
             try {
                 $gres = $this->methodCallAsyncRead('channels.getParticipants', ['channel' => $channel, 'filter' => ['_' => $filter, 'q' => $q], 'offset' => $offset, 'limit' => $limit, 'hash' => $hash = $this->getParticipantsHash($channel, $filter, $q, $offset, $limit), 'floodWaitLimit' => 86400]);
-            } catch (RPCErrorException $e) {
-                if ($e->rpc === 'CHAT_ADMIN_REQUIRED') {
-                    $this->logger->logger($e->rpc);
-                    return $has_more;
-                }
-                throw $e;
+            } catch (ChatAdminRequiredError) {
+                $this->logger->logger('CHAT_ADMIN_REQUIRED');
+                return $has_more;
             }
             if ($cached = ($gres['_'] === 'channels.channelParticipantsNotModified')) {
                 $gres = $this->fetchParticipantsCache($channel, $filter, $q, $offset, $limit);
@@ -906,28 +867,20 @@ trait PeerHandler
             $promises = [];
             foreach ($gres['participants'] as $participant) {
                 $promises []= async(function () use (&$res, $participant): void {
-                    $newres = [];
+                    $newres = $participant;
+                    unset($newres['user_id'], $newres['peer']);
                     $newres['user'] = ($this->getPwrChat($participant['user_id'] ?? $participant['peer'], false));
                     if (isset($participant['inviter_id'])) {
+                        unset($newres['inviter_id']);
                         $newres['inviter'] = ($this->getPwrChat($participant['inviter_id'], false));
                     }
                     if (isset($participant['kicked_by'])) {
+                        unset($newres['kicked_by']);
                         $newres['kicked_by'] = ($this->getPwrChat($participant['kicked_by'], false));
                     }
                     if (isset($participant['promoted_by'])) {
+                        unset($newres['promoted_by']);
                         $newres['promoted_by'] = ($this->getPwrChat($participant['promoted_by'], false));
-                    }
-                    if (isset($participant['date'])) {
-                        $newres['date'] = $participant['date'];
-                    }
-                    if (isset($participant['rank'])) {
-                        $newres['rank'] = $participant['rank'];
-                    }
-                    if (isset($participant['admin_rights'])) {
-                        $newres['admin_rights'] = $participant['admin_rights'];
-                    }
-                    if (isset($participant['banned_rights'])) {
-                        $newres['banned_rights'] = $participant['banned_rights'];
                     }
                     switch ($participant['_']) {
                         case 'channelParticipantSelf':

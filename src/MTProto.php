@@ -20,7 +20,7 @@ declare(strict_types=1);
 
 namespace danog\MadelineProto;
 
-use Amp\ByteStream\ReadableStream;
+use Amp\ByteStream\ReadableBuffer;
 use Amp\Cache\Cache;
 use Amp\Cache\LocalCache;
 use Amp\Cancellation;
@@ -30,10 +30,15 @@ use Amp\Future;
 use Amp\Future\UnhandledFutureError;
 use Amp\Http\Client\HttpClient;
 use Amp\Http\Client\Request;
+use Amp\Http\HttpStatus;
+use Amp\Http\Server\DefaultErrorHandler;
+use Amp\Http\Server\Request as ServerRequest;
+use Amp\Http\Server\RequestHandler;
+use Amp\Http\Server\Response as ServerResponse;
+use Amp\Http\Server\SocketHttpServer;
 use Amp\SignalException;
 use Amp\Sync\LocalKeyedMutex;
 use Amp\Sync\LocalMutex;
-use AssertionError;
 use danog\AsyncOrm\Annotations\OrmMappedArray;
 use danog\AsyncOrm\DbArray;
 use danog\AsyncOrm\DbArrayBuilder;
@@ -41,8 +46,11 @@ use danog\AsyncOrm\Driver\MemoryArray;
 use danog\AsyncOrm\KeyType;
 use danog\AsyncOrm\Settings as OrmSettings;
 use danog\AsyncOrm\ValueType;
+use danog\BetterPrometheus\BetterCounter;
+use danog\BetterPrometheus\BetterGauge;
+use danog\BetterPrometheus\BetterHistogram;
+use danog\BetterPrometheus\BetterSummary;
 use danog\MadelineProto\Broadcast\Broadcast;
-use danog\MadelineProto\EventHandler\Media;
 use danog\MadelineProto\EventHandler\Message;
 use danog\MadelineProto\Ipc\Server;
 use danog\MadelineProto\Loop\Generic\PeriodicLoopInternal;
@@ -58,6 +66,7 @@ use danog\MadelineProto\MTProtoTools\PasswordCalculator;
 use danog\MadelineProto\MTProtoTools\PeerDatabase;
 use danog\MadelineProto\MTProtoTools\PeerHandler;
 use danog\MadelineProto\MTProtoTools\ReferenceDatabase;
+use danog\MadelineProto\MTProtoTools\ResponseInfo;
 use danog\MadelineProto\MTProtoTools\UpdateHandler;
 use danog\MadelineProto\Settings\Database\DriverDatabaseAbstract;
 use danog\MadelineProto\Settings\TLSchema;
@@ -76,6 +85,12 @@ use danog\MadelineProto\Wrappers\Events;
 use danog\MadelineProto\Wrappers\Login;
 use danog\MadelineProto\Wrappers\Loop;
 use danog\MadelineProto\Wrappers\Start;
+use Prometheus\Counter;
+use Prometheus\Gauge;
+use Prometheus\Histogram;
+use Prometheus\RendererInterface;
+use Prometheus\RenderTextFormat;
+use Prometheus\Summary;
 use Psr\Log\LoggerInterface;
 use Revolt\EventLoop;
 use SplQueue;
@@ -83,6 +98,7 @@ use Throwable;
 use Webmozart\Assert\Assert;
 
 use function Amp\async;
+use function Amp\ByteStream\pipe;
 use function Amp\File\deleteFile;
 use function Amp\File\getSize;
 use function Amp\File\openFile;
@@ -509,6 +525,103 @@ final class MTProto implements TLCallback, LoggerGetter, SettingsGetter
     }
 
     /**
+     * Renders prometheus stats using the specified renderer.
+     *
+     * By default uses the text renderer.
+     */
+    public function renderPromStats(?RendererInterface $renderer = null): string
+    {
+        return ($renderer ?? new RenderTextFormat)->render(
+            GarbageCollector::$prometheus->storageAdapter->collect()
+        );
+    }
+
+    /**
+     * Creates and returns a prometheus gauge.
+     *
+     * Returns null if prometheus stats are disabled.
+     *
+     * @param array<string, string> $labels
+     */
+    public function getPromGauge(string $namespace, string $name, string $help, array $labels = []): ?BetterGauge
+    {
+        if (!$this->getSettings()->getMetrics()->getEnablePrometheusCollection()) {
+            return null;
+        }
+        return GarbageCollector::$prometheus->getOrRegisterGauge(
+            $namespace,
+            $name,
+            $help,
+            $labels + ['session' => $this->getSessionName(), 'session_id' => (string) ($this->getSelf()['id'] ?? '')],
+        );
+    }
+
+    /**
+     * Creates and returns a prometheus counter.
+     *
+     * Returns null if prometheus stats are disabled.
+     *
+     * @param array<string, string> $labels
+     */
+    public function getPromCounter(string $namespace, string $name, string $help, array $labels = []): ?BetterCounter
+    {
+        if (!$this->getSettings()->getMetrics()->getEnablePrometheusCollection()) {
+            return null;
+        }
+        return GarbageCollector::$prometheus->getOrRegisterCounter(
+            $namespace,
+            $name,
+            $help,
+            $labels + ['session' => $this->getSessionName(), 'session_id' => (string) ($this->getSelf()['id'] ?? '')],
+        );
+    }
+
+    /**
+     * Creates and returns a prometheus summary.
+     *
+     * Returns null if prometheus stats are disabled.
+     *
+     * @param array<string, string> $labels
+     * @param ?non-empty-list<float> $quantiles
+     */
+    public function getPromSummary(string $namespace, string $name, string $help, array $labels = [], int $maxAgeSeconds = 600, ?array $quantiles = null): ?BetterSummary
+    {
+        if (!$this->getSettings()->getMetrics()->getEnablePrometheusCollection()) {
+            return null;
+        }
+        return GarbageCollector::$prometheus->getOrRegisterSummary(
+            $namespace,
+            $name,
+            $help,
+            $labels + ['session' => $this->getSessionName(), 'session_id' => (string) ($this->getSelf()['id'] ?? '')],
+            $maxAgeSeconds,
+            $quantiles
+        );
+    }
+
+    /**
+     * Creates and returns a prometheus histogram.
+     *
+     * Returns null if prometheus stats are disabled.
+     *
+     * @param array<string, string> $labels
+     * @param ?non-empty-list<float> $buckets
+     */
+    public function getPromHistogram(string $namespace, string $name, string $help, array $labels = [], ?array $buckets = null): ?BetterHistogram
+    {
+        if (!$this->getSettings()->getMetrics()->getEnablePrometheusCollection()) {
+            return null;
+        }
+        return GarbageCollector::$prometheus->getOrRegisterHistogram(
+            $namespace,
+            $name,
+            $help,
+            $labels + ['session' => $this->getSessionName(), 'session_id' => (string) ($this->getSelf()['id'] ?? '')],
+            $buckets
+        );
+    }
+
+    /**
      * Initialization function.
      *
      * @internal
@@ -519,12 +632,6 @@ final class MTProto implements TLCallback, LoggerGetter, SettingsGetter
         Magic::start(light: false);
         // Parse and store settings
         $this->updateSettingsInternal($settings, false);
-        // Start IPC server
-        if (!$this->ipcServer) {
-            $this->ipcServer = new Server($this);
-            $this->ipcServer->setIpcPath($this->wrapper->getSession());
-        }
-        $this->ipcServer->start();
         // Actually instantiate needed classes like a boss
         $this->cleanupProperties();
         // Load rsa keys
@@ -741,37 +848,6 @@ final class MTProto implements TLCallback, LoggerGetter, SettingsGetter
     }
 
     /**
-     * Provide a stream for a file, URL or amp stream.
-     */
-    public function getStream(Message|Media|LocalFile|RemoteUrl|BotApiFileId|ReadableStream $stream, ?Cancellation $cancellation = null): ReadableStream
-    {
-        if ($stream instanceof LocalFile) {
-            return openFile($stream->file, 'r');
-        }
-        if ($stream instanceof RemoteUrl) {
-            $request = new Request($stream->url);
-            $request->setTransferTimeout(INF);
-            return $this->getHTTPClient()->request(
-                $request,
-                $cancellation
-            )->getBody();
-        }
-        if ($stream instanceof Message) {
-            $stream = $stream->media;
-            if ($stream === null) {
-                throw new AssertionError("The message must be a media message!");
-            }
-        }
-        if ($stream instanceof Media) {
-            return $stream->getStream(cancellation: $cancellation);
-        }
-        if ($stream instanceof BotApiFileId) {
-            return $this->downloadToReturnedStream($stream, cancellation: $cancellation);
-        }
-        return $stream;
-    }
-
-    /**
      * Get async DNS client.
      */
     public function getDNSClient(): DnsResolver
@@ -783,9 +859,9 @@ final class MTProto implements TLCallback, LoggerGetter, SettingsGetter
      *
      * @param string $url URL
      */
-    public function fileGetContents(string $url): string
+    public function fileGetContents(string $url, ?Cancellation $cancellation = null): string
     {
-        return $this->getHTTPClient()->request(new Request($url))->getBody()->buffer();
+        return $this->getHTTPClient()->request(new Request($url), $cancellation)->getBody()->buffer($cancellation);
     }
     /**
      * Get main DC ID.
@@ -850,6 +926,8 @@ final class MTProto implements TLCallback, LoggerGetter, SettingsGetter
             $this->ipcServer = null;
         }
     }
+
+    private ?SocketHttpServer $promServer = null;
     /**
      * Clean up properties from previous versions of MadelineProto.
      *
@@ -857,6 +935,68 @@ final class MTProto implements TLCallback, LoggerGetter, SettingsGetter
      */
     private function cleanupProperties(): void
     {
+        if ($this->getSettings()->getMetrics()->getEnableMemprofCollection()) {
+            if (!\extension_loaded('memprof')) {
+                throw Exception::extension('memprof');
+            }
+            if (!memprof_enabled()) {
+                throw new Exception("Memory profiling is not enabled, set the MEMPROF_PROFILE=1 environment variable or GET parameter to enable it.");
+            }
+        }
+        $info = $this->getPromGauge("MadelineProto", "version", "Info about the MadelineProto instance");
+        $info?->set(1, [
+            'php_version' => PHP_VERSION,
+            'madeline_version' => API::RELEASE,
+        ]);
+        $endpoint = $this->getSettings()->getMetrics()->getMetricsBindTo();
+        $this->promServer?->stop();
+        if ($endpoint === null) {
+            $this->promServer = null;
+        } else {
+            /** @psalm-suppress ImpureMethodCall */
+            $this->promServer = SocketHttpServer::createForDirectAccess(
+                $this->getPsrLogger()
+            );
+            $this->promServer->expose($endpoint);
+            $this->promServer->start(new class($this) implements RequestHandler {
+                public function __construct(
+                    private readonly MTProto $API
+                ) {
+                }
+                public function handleRequest(ServerRequest $request): ServerResponse
+                {
+                    if ($request->getUri()->getPath() === '/metrics') {
+                        return new ServerResponse(
+                            status: HttpStatus::OK,
+                            headers: ['Content-Type' => 'text/plain'],
+                            body: $this->API->renderPromStats(),
+                        );
+                    }
+                    if ($request->getUri()->getPath() === '/debug/pprof'
+                        && $this->API->getSettings()->getMetrics()->getEnableMemprofCollection()
+                    ) {
+                        return new ServerResponse(
+                            status: HttpStatus::OK,
+                            headers: ['Content-Type' => 'text/plain'],
+                            body: $this->API->getMemoryProfile(),
+                        );
+                    }
+                    $result = ResponseInfo::error(HttpStatus::NOT_FOUND);
+                    return new ServerResponse(
+                        $result->getCode(),
+                        $result->getHeaders(),
+                        $result->getCodeExplanation()
+                    );
+                }
+            }, new DefaultErrorHandler);
+        }
+        $this->updateCtr = $this->getPromCounter("MadelineProto", "update_count", "Number of received updates since the session was created");
+        // Start IPC server
+        if (!$this->ipcServer) {
+            $this->ipcServer = new Server($this);
+            $this->ipcServer->setIpcPath($this->wrapper->getSession());
+        }
+        $this->ipcServer->start();
         if (!isset($this->updateQueue)) {
             $q = new SplQueue;
             $q->setIteratorMode(SplQueue::IT_MODE_DELETE);
@@ -867,7 +1007,7 @@ final class MTProto implements TLCallback, LoggerGetter, SettingsGetter
             $this->updateState = new CombinedUpdatesState;
             foreach ($this->channels_state->get() as $channelId => $state) {
                 if ($channelId !== 0) {
-                    $channelId = \danog\MadelineProto\MTProtoTools\DialogId::fromSupergroupOrChannel($channelId);
+                    $channelId = \danog\DialogId\DialogId::fromSupergroupOrChannelId($channelId);
                 }
                 $this->updateState->get($channelId)->update(
                     $channelId ? [
@@ -950,7 +1090,7 @@ final class MTProto implements TLCallback, LoggerGetter, SettingsGetter
         foreach ($this->secretChats as $chat) {
             try {
                 $chat->notifyLayer();
-            } catch (RPCErrorException $e) {
+            } catch (RPCErrorException) {
             }
         }
 
@@ -987,11 +1127,6 @@ final class MTProto implements TLCallback, LoggerGetter, SettingsGetter
         try {
             // Setup logger
             $this->setupLogger();
-            if (!$this->ipcServer) {
-                $this->ipcServer = new Server($this);
-                $this->ipcServer->setIpcPath($this->wrapper->getSession());
-            }
-            $this->ipcServer->start();
 
             // Cleanup old properties, init new stuffs
             $this->cleanupProperties();
@@ -1197,6 +1332,7 @@ final class MTProto implements TLCallback, LoggerGetter, SettingsGetter
         if (!$this->settings->getAppInfo()->hasApiInfo()) {
             throw new Exception(Lang::$current_lang['api_not_set'], 0, null, 'MadelineProto', 1);
         }
+        /** @var Settings $this->settings */
 
         // Setup logger
         if ($this->settings->getLogger()->hasChanged() || !isset($this->logger)) {
@@ -1207,6 +1343,11 @@ final class MTProto implements TLCallback, LoggerGetter, SettingsGetter
             $this->logger->logger("The database settings have changed!", Logger::WARNING);
             $this->cleanupProperties();
             $this->settings->getDb()->applyChanges();
+        }
+        if ($this->settings->getMetrics()->hasChanged()) {
+            $this->logger->logger("The prometheus settings have changed!", Logger::WARNING);
+            $this->cleanupProperties();
+            $this->settings->getMetrics()->applyChanges();
         }
         if ($this->settings->getSerialization()->hasChanged()) {
             $this->logger->logger("The serialization settings have changed!", Logger::WARNING);
@@ -1741,24 +1882,27 @@ final class MTProto implements TLCallback, LoggerGetter, SettingsGetter
             if ($this->settings->getLogger()->getType() === Logger::FILE_LOGGER
                 && $path = $this->settings->getLogger()->getExtra()) {
                 $temp = tempnam(sys_get_temp_dir(), 'madelinelog');
-                copy($path, $temp);
+                pipe(openFile($path, 'r'), openFile($temp, 'w'));
                 $path = $temp;
-                if (!getSize($path)) {
-                    $message = "!!! WARNING !!!\nThe logfile is empty, please DO NOT delete the logfile to avoid errors in MadelineProto!\n\n$message";
-                } else {
-                    $file = $this->methodCallAsyncRead(
-                        'messages.uploadMedia',
-                        [
-                            'peer' => $this->reportDest[0],
-                            'media' => [
-                                '_' => 'inputMediaUploadedDocument',
-                                'file' => $path,
-                                'attributes' => [
-                                    ['_' => 'documentAttributeFilename', 'file_name' => 'MadelineProto.log'],
+                try {
+                    if (!getSize($path)) {
+                        $message = "!!! WARNING !!!\nThe logfile is empty, please DO NOT delete the logfile to avoid errors in MadelineProto!\n\n$message";
+                    } else {
+                        $file = $this->methodCallAsyncRead(
+                            'messages.uploadMedia',
+                            [
+                                'peer' => $this->reportDest[0],
+                                'media' => [
+                                    '_' => 'inputMediaUploadedDocument',
+                                    'file' => $path,
+                                    'attributes' => [
+                                        ['_' => 'documentAttributeFilename', 'file_name' => 'MadelineProto.log'],
+                                    ],
                                 ],
                             ],
-                        ],
-                    );
+                        );
+                    }
+                } finally {
                     deleteFile($path);
                 }
             }
@@ -1783,9 +1927,9 @@ final class MTProto implements TLCallback, LoggerGetter, SettingsGetter
         }
     }
     /**
-     * Report memory profile with memprof.
+     * Get memory profile with memprof.
      */
-    public function reportMemoryProfile(): void
+    public function getMemoryProfile(): string
     {
         if (!\extension_loaded('memprof')) {
             throw Exception::extension('memprof');
@@ -1793,14 +1937,24 @@ final class MTProto implements TLCallback, LoggerGetter, SettingsGetter
         if (!memprof_enabled()) {
             throw new Exception("Memory profiling is not enabled, set the MEMPROF_PROFILE=1 environment variable or GET parameter to enable it.");
         }
-
-        $current = "Current memory usage: ".round(memory_get_usage()/1024/1024, 1) . " MB";
         $file = fopen('php://memory', 'r+');
         memprof_dump_pprof($file);
         fseek($file, 0);
+
+        return stream_get_contents($file);
+    }
+
+    /**
+     * Report memory profile with memprof.
+     */
+    public function reportMemoryProfile(): void
+    {
+        $pprof = $this->getMemoryProfile();
+
+        $current = "Current memory usage: ".round(memory_get_usage()/1024/1024, 1) . " MB";
         $file = [
             '_' => 'inputMediaUploadedDocument',
-            'file' => $file,
+            'file' => new ReadableBuffer($pprof),
             'attributes' => [
                 ['_' => 'documentAttributeFilename', 'file_name' => 'report.pprof'],
             ],

@@ -28,12 +28,13 @@ use danog\AsyncOrm\DbArray;
 use danog\AsyncOrm\DbArrayBuilder;
 use danog\AsyncOrm\KeyType;
 use danog\AsyncOrm\ValueType;
+use danog\MadelineProto\EventHandler\Media\Photo;
 use danog\MadelineProto\Exception;
 use danog\MadelineProto\LegacyMigrator;
 use danog\MadelineProto\Logger;
 use danog\MadelineProto\MTProto;
 use danog\MadelineProto\PeerNotInDbException;
-use danog\MadelineProto\RPCError\FloodWaitError;
+use danog\MadelineProto\RPCError\UsernameNotOccupiedError;
 use danog\MadelineProto\RPCErrorException;
 use danog\MadelineProto\TL\TLCallback;
 use danog\MadelineProto\Tools;
@@ -57,17 +58,17 @@ final class PeerDatabase implements TLCallback
      *
      * @var DbArray<int, array>
      */
-    #[OrmMappedArray(KeyType::INT, ValueType::SCALAR, tablePostfix: 'MTProto_chats')]
+    #[OrmMappedArray(KeyType::INT, ValueType::SCALAR, tablePostfix: '_MTProto_chats')]
     private $db;
     /**
      * @var DbArray<int, array>
      */
-    #[OrmMappedArray(KeyType::INT, ValueType::SCALAR, tablePostfix: 'MTProto_full_chats')]
+    #[OrmMappedArray(KeyType::INT, ValueType::SCALAR, tablePostfix: '_MTProto_full_chats')]
     private $fullDb;
     /**
      * @var DbArray<string, int>
      */
-    #[OrmMappedArray(KeyType::STRING, ValueType::INT)]
+    #[OrmMappedArray(KeyType::STRING, ValueType::INT, tablePostfix: '_PeerDatabase_usernames')]
     private $usernames;
     private bool $hasInfo = true;
     private bool $hasUsernames = true;
@@ -95,7 +96,7 @@ final class PeerDatabase implements TLCallback
     }
     public function init(): void
     {
-        $this->initDbProperties($this->API->getDbSettings(), $this->API->getDbPrefix().'_PeerDatabase_');
+        $this->initDbProperties($this->API->getDbSettings(), $this->API->getDbPrefix());
         if (!$this->API->settings->getDb()->getEnableFullPeerDb()) {
             $this->fullDb->clear();
         }
@@ -153,7 +154,11 @@ final class PeerDatabase implements TLCallback
 
     public function getFull(int $id): ?array
     {
-        return $this->fullDb[$id];
+        $result = $this->fullDb[$id];
+        if ($result !== null) {
+            $result['id'] = $id;
+        }
+        return $result;
     }
     public function expireFull(int $id): void
     {
@@ -251,7 +256,7 @@ final class PeerDatabase implements TLCallback
      */
     public function fullChatLastUpdated(mixed $id): int
     {
-        return $this->getFull($id)['last_update'] ?? 0;
+        return $this->getFull($id)['inserted'] ?? 0;
     }
 
     private function recacheChatUsername(int $id, ?array $old, array $new): void
@@ -331,13 +336,7 @@ final class PeerDatabase implements TLCallback
             $result = $this->API->getIdInternal(
                 ($this->API->methodCallAsyncRead('contacts.resolveUsername', ['username' => $username]))['peer'],
             );
-        } catch (FloodWaitError $e) {
-            throw $e;
-        } catch (RPCErrorException $e) {
-            $this->API->logger('Username resolution failed with error '.$e->getMessage(), Logger::ERROR);
-            if ($e->rpc === 'AUTH_KEY_UNREGISTERED' || $e->rpc === 'USERNAME_INVALID') {
-                throw $e;
-            }
+        } catch (UsernameNotOccupiedError) {
         } finally {
             unset($this->caching_simple_username[$username]);
         }
@@ -432,6 +431,9 @@ final class PeerDatabase implements TLCallback
                 $this->db[$user['id']] = $user;
                 if ($existingChat && ($existingChat['min'] ?? false) && !($user['min'] ?? false)) {
                     $this->API->minDatabase->clearPeer($user['id']);
+                }
+                if ($existingChat && ($existingChat['bot_info_version'] ?? null) !== ($user['bot_info_version'] ?? null)) {
+                    $this->expireFull($user['id']);
                 }
             }
         } finally {
@@ -580,9 +582,18 @@ final class PeerDatabase implements TLCallback
      */
     private function addFullChat(array $full): void
     {
+        foreach (['chat_photo', 'personal_photo', 'fallback_photo', 'profile_photo'] as $k) {
+            if (isset($full[$k])) {
+                if ($full[$k]['_'] === 'photoEmpty') {
+                    unset($full[$k]);
+                } else {
+                    $full[$k] = new Photo($this->API, $full[$k], false);
+                }
+            }
+        }
         $this->fullDb[$this->API->getIdInternal($full)] = [
             'full' => $full,
-            'last_update' => time(),
+            'inserted' => time(),
         ];
     }
 

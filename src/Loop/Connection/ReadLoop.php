@@ -22,15 +22,15 @@ namespace danog\MadelineProto\Loop\Connection;
 
 use Amp\ByteStream\PendingReadError;
 use Amp\ByteStream\StreamException;
-use Amp\Websocket\ClosedException;
+use Amp\Websocket\WebsocketClosedException;
 use danog\Loop\Loop;
 use danog\MadelineProto\Logger;
 use danog\MadelineProto\MTProto\MTProtoIncomingMessage;
 use danog\MadelineProto\MTProtoTools\Crypt;
 use danog\MadelineProto\NothingInTheSocketException;
-use danog\MadelineProto\RPCErrorException;
 use danog\MadelineProto\SecurityException;
 use danog\MadelineProto\Tools;
+use danog\MadelineProto\TransportError;
 use Error;
 use Revolt\EventLoop;
 
@@ -109,7 +109,7 @@ final class ReadLoop extends Loop
                     $this->connection->reconnect();
                 } else {
                     $this->connection->reconnect();
-                    throw new RPCErrorException((string) $error, $error);
+                    throw new TransportError($error);
                 }
             });
             $this->API->logger("Stopping $this due to $error...", Logger::ERROR);
@@ -130,7 +130,7 @@ final class ReadLoop extends Loop
         }
         try {
             $buffer = $this->connection->stream->getReadBuffer($payload_length);
-        } catch (ClosedException $e) {
+        } catch (WebsocketClosedException $e) {
             $this->API->logger($e->getReason());
             if (str_starts_with($e->getReason(), '       ')) {
                 $payload = -((int) substr($e->getReason(), 7));
@@ -139,10 +139,13 @@ final class ReadLoop extends Loop
             }
             throw $e;
         }
+        /** @var int $payload_length */
         if ($payload_length & (1 << 31)) {
             $this->API->logger("Received quick ACK $payload_length from DC ".$this->datacenter, Logger::ULTRA_VERBOSE);
+            $this->connection->incomingBytesCtr?->incBy(4);
             return null;
         }
+        $this->connection->incomingBytesCtr?->incBy(4+$payload_length);
         if ($payload_length <= 16) {
             $code = Tools::unpackSignedInt($buffer->bufferRead(4));
             if ($code === -1 && $payload_length >= 8) {
@@ -177,6 +180,7 @@ final class ReadLoop extends Loop
                     if ($left < (-$message_length & 15)) {
                         $this->API->logger('Protocol padded unencrypted message', Logger::ULTRA_VERBOSE);
                     }
+                    $this->connection->incomingBytesCtr?->incBy($left);
                     $buffer->bufferRead($left);
                 }
             } elseif ($auth_key_id === $this->shared->getTempAuthKey()->getID()) {
@@ -187,6 +191,7 @@ final class ReadLoop extends Loop
                 $payload_length -= $left;
                 $decrypted_data = Crypt::igeDecrypt($buffer->bufferRead($payload_length), $aes_key, $aes_iv);
                 if ($left) {
+                    $this->connection->incomingBytesCtr?->incBy($left);
                     $buffer->bufferRead($left);
                 }
                 if ($message_key != substr(hash('sha256', substr($this->shared->getTempAuthKey()->getAuthKey(), 96, 32).$decrypted_data, true), 8, 16)) {
@@ -247,6 +252,7 @@ final class ReadLoop extends Loop
 
             $this->connection->new_incoming->enqueue($message);
             $this->connection->incoming_messages[$message_id] = $message;
+            $this->connection->incomingCtr?->inc();
         } finally {
             $this->connection->reading(false);
         }
